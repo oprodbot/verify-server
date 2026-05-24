@@ -1,114 +1,7 @@
 from flask import Flask, request, render_template_string
 import json
 import os
-from datetime import datetime, timedelta
-
-app = Flask(__name__)
-SOUBOR_TOKENU = "tokeny.json"
-SOUBOR_RESETU = "resety.json"
-
-
-def nacti_json(soubor):
-    if not os.path.exists(soubor):
-        return {}
-    try:
-        with open(soubor, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def uloz_json(soubor, data):
-    with open(soubor, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def vycisti_stare(data):
-    ted = datetime.utcnow()
-    nove = {}
-    for token, info in data.items():
-        vytvoreno = datetime.fromisoformat(info["vytvoreno"])
-        if ted - vytvoreno < timedelta(hours=24):
-            nove[token] = info
-    return nove
-
-
-# ===== OVĚŘENÍ EMAILU (původní) =====
-
-@app.route("/register-token", methods=["POST"])
-def register_token():
-    data = request.get_json()
-    token = data.get("token")
-    email = data.get("email")
-    if not token or not email:
-        return {"ok": False, "error": "missing token or email"}, 400
-    tokeny = nacti_json(SOUBOR_TOKENU)
-    tokeny = vycisti_stare(tokeny)
-    tokeny[token] = {
-        "email": email,
-        "overeno": False,
-        "vytvoreno": datetime.utcnow().isoformat(),
-    }
-    uloz_json(SOUBOR_TOKENU, tokeny)
-    return {"ok": True}
-
-
-@app.route("/verify")
-def verify():
-    token = request.args.get("token", "")
-    tokeny = nacti_json(SOUBOR_TOKENU)
-    if token not in tokeny:
-        return render_template_string(STRANKA_CHYBA, sprava="Tento odkaz je neplatný nebo expirovaný."), 404
-    if tokeny[token]["overeno"]:
-        return render_template_string(STRANKA_OK, email=tokeny[token]["email"], jiz="(už dříve)")
-    tokeny[token]["overeno"] = True
-    tokeny[token]["overeno_kdy"] = datetime.utcnow().isoformat()
-    uloz_json(SOUBOR_TOKENU, tokeny)
-    return render_template_string(STRANKA_OK, email=tokeny[token]["email"], jiz="")
-
-
-@app.route("/status")
-def status():
-    token = request.args.get("token", "")
-    tokeny = nacti_json(SOUBOR_TOKENU)
-    if token not in tokeny:
-        return {"exists": False, "verified": False}
-    return {
-        "exists": True,
-        "verified": tokeny[token]["overeno"],
-        "email": tokeny[token]["email"],
-    }
-
-
-# ===== RESET HESLA (nové) =====
-
-@app.route("/register-reset", methods=["POST"])
-def register_reset():
-    """Appka pošle: { 'token': '...', 'email': '...' }"""
-    data = request.get_json()
-    token = data.get("token")
-    email = data.get("email")
-    if not token or not email:
-        return {"ok": False, "error": "missing token or email"}, 400
-    resety = nacti_json(SOUBOR_RESETU)
-    resety = vycisti_stare(resety)
-    resety[token] = {
-        "email": email,
-        "hotovo": False,
-        "nove_heslo": None,
-        "vytvoreno": datetime.utcnow().isoformat(),
-    }
-    uloz_json(SOUBOR_RESETU, resety)
-    return {"ok": True}
-
-
-@app.route("/reset", methods=["GET", "POST"])
-def reset():
-    """Uživatel sem klikne z mailu (GET = formulář, POST = uložení)."""
-    token = request.args.get("token", "")
-
-import json
-import os
+import bcrypt
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -140,6 +33,11 @@ def vycisti_stare(data):
         if ted - vytvoreno < timedelta(hours=24):
             nove[token] = info
     return nove
+
+
+def zhashuj_heslo(plain):
+    """Vrátí bcrypt hash jako string."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 # ===== OVĚŘENÍ EMAILU =====
@@ -189,7 +87,7 @@ def status():
     }
 
 
-# ===== RESET HESLA =====
+# ===== RESET HESLA (s bcrypt hashováním na serveru) =====
 
 @app.route("/register-reset", methods=["POST"])
 def register_reset():
@@ -203,7 +101,7 @@ def register_reset():
     resety[token] = {
         "email": email,
         "hotovo": False,
-        "nove_heslo": None,
+        "hash": None,
         "vytvoreno": datetime.utcnow().isoformat(),
     }
     uloz_json(SOUBOR_RESETU, resety)
@@ -216,10 +114,17 @@ def reset():
     resety = nacti_json(SOUBOR_RESETU)
 
     if token not in resety:
-        return render_template_string(STRANKA_CHYBA, sprava="Tento odkaz pro reset hesla je neplatný nebo expirovaný."), 404
+        return render_template_string(
+            STRANKA_CHYBA,
+            sprava="Tento odkaz pro reset hesla je neplatný nebo expirovaný."
+        ), 404
 
+    # Token už byl použit – druhé kliknutí
     if resety[token]["hotovo"]:
-        return render_template_string(STRANKA_RESET_HOTOVO, email=resety[token]["email"])
+        return render_template_string(
+            STRANKA_CHYBA,
+            sprava="This link has already been used. Please request a new reset link."
+        ), 410
 
     if request.method == "POST":
         nove_heslo = request.form.get("heslo", "").strip()
@@ -228,16 +133,18 @@ def reset():
         if len(nove_heslo) < 4:
             return render_template_string(
                 STRANKA_RESET_FORM, token=token, email=resety[token]["email"],
-                chyba="Heslo musí mít aspoň 4 znaky."
+                chyba="Password must be at least 4 characters long."
             )
         if nove_heslo != nove_heslo2:
             return render_template_string(
                 STRANKA_RESET_FORM, token=token, email=resety[token]["email"],
-                chyba="Hesla se neshodují."
+                chyba="Passwords do not match."
             )
 
+        # Zhashuj heslo a ulož hash
+        hash_str = zhashuj_heslo(nove_heslo)
         resety[token]["hotovo"] = True
-        resety[token]["nove_heslo"] = nove_heslo
+        resety[token]["hash"] = hash_str
         resety[token]["dokonceno_kdy"] = datetime.utcnow().isoformat()
         uloz_json(SOUBOR_RESETU, resety)
         return render_template_string(STRANKA_RESET_HOTOVO, email=resety[token]["email"])
@@ -249,15 +156,28 @@ def reset():
 
 @app.route("/reset-status")
 def reset_status():
+    """Klient se ptá; po dokončení vrací hash (ne plaintext).
+    Po 5 minutách od dokončení záznam vyčistíme."""
     token = request.args.get("token", "")
     resety = nacti_json(SOUBOR_RESETU)
     if token not in resety:
         return {"exists": False, "done": False}
+
+    info = resety[token]
+
+    # Cleanup: pokud je hotovo a uplynulo 5 min od dokončení, smaž
+    if info.get("hotovo") and info.get("dokonceno_kdy"):
+        dokonceno = datetime.fromisoformat(info["dokonceno_kdy"])
+        if datetime.utcnow() - dokonceno > timedelta(minutes=5):
+            del resety[token]
+            uloz_json(SOUBOR_RESETU, resety)
+            return {"exists": False, "done": False}
+
     return {
         "exists": True,
-        "done": resety[token]["hotovo"],
-        "email": resety[token]["email"],
-        "new_password": resety[token]["nove_heslo"] if resety[token]["hotovo"] else None,
+        "done": info["hotovo"],
+        "email": info["email"],
+        "new_password": info["hash"] if info["hotovo"] else None,
     }
 
 
@@ -265,15 +185,6 @@ def reset_status():
 
 @app.route("/register-email-change", methods=["POST"])
 def register_email_change():
-    """
-    Appka pošle: {
-      'token_old': '...',
-      'token_new': '...',
-      'old_email': '...',
-      'new_email': '...',
-      'prezdivka': '...'
-    }
-    """
     data = request.get_json()
     token_old = data.get("token_old")
     token_new = data.get("token_new")
@@ -303,7 +214,6 @@ def register_email_change():
 
 
 def _najdi_zmenu_podle_tokenu(zmeny, token, klic):
-    """Najde záznam, kde záznam[klic] == token."""
     for sid, info in zmeny.items():
         if info.get(klic) == token:
             return sid, info
@@ -368,9 +278,6 @@ def confirm_email_new():
 
 @app.route("/email-change-status")
 def email_change_status():
-    """
-    Appka se ptá podle token_old (svého) – stačí jeden, vrátíme stav obou.
-    """
     token = request.args.get("token", "")
     zmeny = nacti_json(SOUBOR_EMAIL_CHANGE)
     sid, info = _najdi_zmenu_podle_tokenu(zmeny, token, "token_old")
@@ -424,14 +331,14 @@ STRANKA_CHYBA = """
          display: flex; justify-content: center; align-items: center;
          height: 100vh; margin: 0; }
   .karta { background: white; padding: 48px 56px; border-radius: 16px;
-           box-shadow: 0 8px 32px rgba(0,0,0,0.08); text-align: center; max-width: 420px; }
+           box-shadow: 0 8px 32px rgba(0,0,0,0.08); text-align: center; max-width: 460px; }
   h1 { color: #c0392b; margin: 0 0 12px; font-size: 28px; }
   p { color: #666; margin: 0; }
   .x { font-size: 64px; margin-bottom: 16px; color: #c0392b; }
 </style></head><body>
   <div class="karta">
     <div class="x">✗</div>
-    <h1>Chyba</h1>
+    <h1>Error</h1>
     <p>{{ sprava }}</p>
   </div>
 </body></html>
@@ -439,7 +346,7 @@ STRANKA_CHYBA = """
 
 STRANKA_RESET_FORM = """
 <!DOCTYPE html>
-<html lang="cs"><head><meta charset="utf-8"><title>Reset hesla</title>
+<html lang="cs"><head><meta charset="utf-8"><title>Reset password</title>
 <style>
   body { font-family: -apple-system, sans-serif; background: #faf6f1;
          display: flex; justify-content: center; align-items: center;
@@ -462,23 +369,38 @@ STRANKA_RESET_FORM = """
            margin-top: 14px; font-size: 14px; }
 </style></head><body>
   <div class="karta">
-    <h1>Nastav nové heslo</h1>
-    <p class="podtitulek">Pro účet <span class="email">{{ email }}</span></p>
-    <form method="POST">
-      <label>Nové heslo</label>
-      <input type="password" name="heslo" required minlength="4" autofocus>
-      <label>Heslo znovu</label>
-      <input type="password" name="heslo2" required minlength="4">
+    <h1>Set new password</h1>
+    <p class="podtitulek">For account <span class="email">{{ email }}</span></p>
+    <form method="POST" onsubmit="return validateForm()">
+      <label>New password</label>
+      <input type="password" id="heslo" name="heslo" required minlength="4" autofocus>
+      <label>Repeat password</label>
+      <input type="password" id="heslo2" name="heslo2" required minlength="4">
       {% if chyba %}<div class="chyba">{{ chyba }}</div>{% endif %}
-      <button type="submit">Uložit nové heslo</button>
+      <button type="submit">Save new password</button>
     </form>
   </div>
+  <script>
+    function validateForm() {
+      var h1 = document.getElementById("heslo").value;
+      var h2 = document.getElementById("heslo2").value;
+      if (h1.length < 4) {
+        alert("Password must be at least 4 characters long.");
+        return false;
+      }
+      if (h1 !== h2) {
+        alert("Passwords do not match.");
+        return false;
+      }
+      return true;
+    }
+  </script>
 </body></html>
 """
 
 STRANKA_RESET_HOTOVO = """
 <!DOCTYPE html>
-<html lang="cs"><head><meta charset="utf-8"><title>Heslo změněno</title>
+<html lang="cs"><head><meta charset="utf-8"><title>Password changed</title>
 <style>
   body { font-family: -apple-system, sans-serif; background: #faf6f1;
          display: flex; justify-content: center; align-items: center;
@@ -492,8 +414,8 @@ STRANKA_RESET_HOTOVO = """
 </style></head><body>
   <div class="karta">
     <div class="check">✓</div>
-    <h1>Heslo změněno</h1>
-    <p>Tvé nové heslo bylo uloženo.<br>Vrať se do aplikace a přihlas se.</p>
+    <h1>Password changed</h1>
+    <p>You can close this tab and return to the app.</p>
     <p class="email">{{ email }}</p>
   </div>
 </body></html>
