@@ -106,6 +106,7 @@ def register_reset():
 def reset():
     """Uživatel sem klikne z mailu (GET = formulář, POST = uložení)."""
     token = request.args.get("token", "")from flask import Flask, request, render_template_string
+
 import json
 import os
 from datetime import datetime, timedelta
