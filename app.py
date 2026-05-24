@@ -105,7 +105,7 @@ def register_reset():
 @app.route("/reset", methods=["GET", "POST"])
 def reset():
     """Uživatel sem klikne z mailu (GET = formulář, POST = uložení)."""
-    token = request.args.get("token", "")from flask import Flask, request, render_template_string
+    token = request.args.get("token", "")
 
 import json
 import os
